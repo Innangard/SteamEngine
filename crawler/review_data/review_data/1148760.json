@@ -1,0 +1,58 @@
+{
+  "app_id": 1148760,
+  "total_reviews": 4917,
+  "reviews_with_playtime": 4917,
+  "reviews_without_playtime": 0,
+  "complete": true,
+  "buckets": [
+    {
+      "label": "0-1h",
+      "min_hours": 0,
+      "max_hours": 1,
+      "positive": 38,
+      "negative": 17
+    },
+    {
+      "label": "1-5h",
+      "min_hours": 1,
+      "max_hours": 5,
+      "positive": 252,
+      "negative": 30
+    },
+    {
+      "label": "5-10h",
+      "min_hours": 5,
+      "max_hours": 10,
+      "positive": 635,
+      "negative": 48
+    },
+    {
+      "label": "10-50h",
+      "min_hours": 10,
+      "max_hours": 50,
+      "positive": 3059,
+      "negative": 75
+    },
+    {
+      "label": "50-100h",
+      "min_hours": 50,
+      "max_hours": 100,
+      "positive": 538,
+      "negative": 10
+    },
+    {
+      "label": "100-500h",
+      "min_hours": 100,
+      "max_hours": 500,
+      "positive": 210,
+      "negative": 2
+    },
+    {
+      "label": "500h+",
+      "min_hours": 500,
+      "max_hours": null,
+      "positive": 3,
+      "negative": 0
+    }
+  ]
+}

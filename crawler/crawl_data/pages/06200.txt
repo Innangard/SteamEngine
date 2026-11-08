@@ -1,0 +1,3 @@
+URL: https://store.steampowered.com//eula/1623730_eula_1
+
+End User License Agreement Language: English You can review the End User License Agreement at the following link. https://eula.pocketpair.jp/palworld Palworld includes the Unreal® Engine code and other code, materials, and information (the "Epic Materials") from Epic Games, Inc. All Epic Materials are provided on an "as is" and "as available" basis, "with all faults" and without warranty of any kind.
