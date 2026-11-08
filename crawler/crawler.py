@@ -27,7 +27,9 @@ import sqlite3
 
 
 SEED_URL = 'https://store.steampowered.com/'
-OUTPUT_DIR = 'crawl_data'
+# Folder this script lives in, so paths work no matter where we run it from
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'crawl_data')
 DELAY = 1.0  # seconds between requests
 
 
@@ -127,12 +129,15 @@ def load_robots(domain):
 
 # ---- SQLite state management ----
 # Tables:
-#   urls  - every URL we've seen, with its page ID and visited flag
-#   queue - URLs waiting to be crawled, with priority for ordering
-#   edges - adjacency list (source page -> target page)
+#   urls      - every URL we've seen, with its page ID and visited flag
+#   queue     - URLs waiting to be crawled, with priority for ordering
+#   edges     - adjacency list (source page -> target page)
+#   page_text - extracted text for each visited page
+#   reviews   - review bucket data per app (written by scraper.py)
 
 def init_db():
-    conn = sqlite3.connect(os.path.join(OUTPUT_DIR, 'crawl.db'))
+    # timeout=30 waits for the scraper's writes instead of erroring
+    conn = sqlite3.connect(os.path.join(OUTPUT_DIR, 'crawl.db'), timeout=30)
     conn.execute('PRAGMA journal_mode=WAL')  # faster writes
     conn.executescript('''
         CREATE TABLE IF NOT EXISTS urls (
@@ -148,6 +153,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS edges (
             source_id INTEGER NOT NULL,
             target_id INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS page_text (
+            page_id INTEGER PRIMARY KEY,
+            url TEXT NOT NULL,
+            text TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS reviews (
+            app_id INTEGER PRIMARY KEY,
+            total_reviews INTEGER DEFAULT 0,
+            reviews_with_playtime INTEGER DEFAULT 0,
+            reviews_without_playtime INTEGER DEFAULT 0,
+            complete INTEGER DEFAULT 0,
+            buckets_json TEXT DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_urls_url ON urls(url);
         CREATE INDEX IF NOT EXISTS idx_queue_pop ON queue(priority, pos);
@@ -248,8 +266,10 @@ def db_import_pages(conn):
         filepath = os.path.join(pages_dir, filename)
         with open(filepath, 'r', encoding='utf-8') as f:
             first_line = f.readline().strip()
-        if not first_line.startswith('URL: '):
-            continue
+            if not first_line.startswith('URL: '):
+                continue
+            f.readline()  # skip blank line
+            text = f.read()
 
         url = first_line[5:]
         visited.add(url)
@@ -260,6 +280,9 @@ def db_import_pages(conn):
         conn.execute(
             'INSERT OR IGNORE INTO urls (id, url, visited) VALUES (?, ?, 1)',
             (page_id, url))
+        conn.execute(
+            'INSERT OR REPLACE INTO page_text (page_id, url, text) '
+            'VALUES (?, ?, ?)', (page_id, url, text))
         imported += 1
 
     conn.commit()
@@ -273,6 +296,51 @@ def db_import_pages(conn):
         'url_to_id': url_to_id,
         'next_id': max_id + 1
     }
+
+
+# Copy text from page files into page_text for any pages that
+# aren't in the table yet. Only does real work the first time
+# after upgrading, after that everything is already in the DB.
+def backfill_page_text(conn):
+    pages_dir = os.path.join(OUTPUT_DIR, 'pages')
+    if not os.path.isdir(pages_dir):
+        return
+
+    have = set()
+    for row in conn.execute('SELECT page_id FROM page_text'):
+        have.add(row[0])
+
+    added = 0
+    for filename in os.listdir(pages_dir):
+        if not filename.endswith('.txt'):
+            continue
+        try:
+            page_id = int(filename.replace('.txt', ''))
+        except ValueError:
+            continue
+        if page_id in have:
+            continue
+
+        filepath = os.path.join(pages_dir, filename)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            first_line = f.readline().strip()
+            if not first_line.startswith('URL: '):
+                continue
+            f.readline()  # skip blank line
+            text = f.read()
+
+        conn.execute(
+            'INSERT OR REPLACE INTO page_text (page_id, url, text) '
+            'VALUES (?, ?, ?)', (page_id, first_line[5:], text))
+        added += 1
+        # Commit in chunks so a crash doesn't lose everything
+        if added % 5000 == 0:
+            conn.commit()
+            print('  backfilled {} pages...'.format(added))
+
+    conn.commit()
+    if added > 0:
+        print('Backfilled {} pages into page_text'.format(added))
 
 
 # Save the adjacency data as a sparse edge list, gzipped.
@@ -310,6 +378,7 @@ def crawl(resume=False):
 
     # Open or create the database
     conn = init_db()
+    backfill_page_text(conn)
 
     # Either resume from database or start fresh
     if resume:
@@ -462,9 +531,15 @@ def crawl(resume=False):
             # Commit all writes for this page at once
             conn.commit()
 
-            # Write the extracted text to a file (skip on rescan)
+            # Save extracted text (skip on rescan)
             if not rescan:
                 text = parser.get_text()
+                # Store in database
+                conn.execute(
+                    'INSERT OR REPLACE INTO page_text (page_id, url, text) '
+                    'VALUES (?, ?, ?)', (page_id, url, text))
+                conn.commit()
+                # Also write to file for backwards compatibility
                 page_file = os.path.join(OUTPUT_DIR, 'pages',
                                          '{:05d}.txt'.format(page_id))
                 with open(page_file, 'w', encoding='utf-8') as f:

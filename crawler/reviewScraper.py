@@ -1,8 +1,8 @@
 # Steam Review Scraper
-# Reads app IDs from the crawler's urls.json and fetches
-# reviews from Steam's public review API. Saves bucketed
-# data (positive/negative counts by playtime bracket) as
-# JSON files, one per game.
+# Reads app IDs from crawl.db (shared with crawler.py) and
+# fetches reviews from Steam's API. Saves bucketed data
+# (positive/negative counts by playtime bracket) into the
+# reviews table in crawl.db, plus JSON files for compatibility.
 #
 # No external dependencies, stdlib only
 #
@@ -18,13 +18,16 @@ import os
 import time
 import sys
 import re
+import sqlite3
 
 
 STEAM_API_KEY = '6DAB5A989112A05893E33A4A6EE588E6'
-CRAWL_DIR = 'crawl_data'
-OUTPUT_DIR = 'review_data'
-DELAY = 0.75  # seconds between API requests
-GAME_DELAY = 2.5  # seconds to wait between games
+# Folder this script lives in, so paths work no matter where we run it from
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CRAWL_DIR = os.path.join(SCRIPT_DIR, 'crawl_data')
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, 'review_data')
+DELAY = 1.5  # seconds between API requests
+GAME_DELAY = 5  # seconds to wait between games
 REVIEWS_PER_GAME = 10000
 REVIEWS_PER_PAGE = 100
 
@@ -54,12 +57,26 @@ def bucket_label(low, high):
 UA = 'SteamReviewScraper/1.0'
 
 
-# Pull app IDs out of the crawler's urls.json by matching
-# URLs that look like /app/730/ or /app/730/Counter-Strike_2/
+# Pull app IDs from crawl.db, falling back to urls.json
 def extract_app_ids():
+    # Try the database first
+    db_path = os.path.join(CRAWL_DIR, 'crawl.db')
+    if os.path.exists(db_path):
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute('SELECT url FROM urls WHERE visited = 1').fetchall()
+        conn.close()
+        app_ids = set()
+        for row in rows:
+            match = re.search(r'/app/(\d+)', row[0])
+            if match:
+                app_ids.add(int(match.group(1)))
+        if app_ids:
+            return sorted(app_ids)
+
+    # Fall back to urls.json
     path = os.path.join(CRAWL_DIR, 'urls.json')
     if not os.path.exists(path):
-        print('No urls.json found in {}/'.format(CRAWL_DIR))
+        print('No crawl.db or urls.json found in {}/'.format(CRAWL_DIR))
         return []
 
     with open(path, 'r') as f:
@@ -213,21 +230,119 @@ def make_buckets(reviews):
     return result, skipped
 
 
+# ---- Database helpers ----
+
+# Open crawl.db and make sure the reviews table exists.
+# The crawler creates it too, but this way the scraper works
+# even if it runs first.
+def open_db():
+    os.makedirs(CRAWL_DIR, exist_ok=True)
+    conn = sqlite3.connect(os.path.join(CRAWL_DIR, 'crawl.db'), timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')  # lets crawler and scraper share it
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS reviews (
+            app_id INTEGER PRIMARY KEY,
+            total_reviews INTEGER DEFAULT 0,
+            reviews_with_playtime INTEGER DEFAULT 0,
+            reviews_without_playtime INTEGER DEFAULT 0,
+            complete INTEGER DEFAULT 0,
+            buckets_json TEXT DEFAULT '[]'
+        )
+    ''')
+    conn.commit()
+    return conn
+
+
+# Look up a previous result for this app, from the DB or an old JSON file.
+# Returns a dict like the JSON output, or None if nothing saved yet.
+def load_previous(conn, app_id):
+    row = conn.execute(
+        'SELECT total_reviews, complete FROM reviews WHERE app_id = ?',
+        (app_id,)).fetchone()
+    if row is not None:
+        return {'total_reviews': row[0], 'complete': bool(row[1])}
+
+    # Fall back to JSON files from before the DB existed
+    out_path = os.path.join(OUTPUT_DIR, '{}.json'.format(app_id))
+    if os.path.exists(out_path):
+        with open(out_path, 'r') as f:
+            return json.load(f)
+    return None
+
+
+# Write one game's results to the DB and to its JSON file
+def save_result(conn, output):
+    conn.execute('''
+        INSERT OR REPLACE INTO reviews
+        (app_id, total_reviews, reviews_with_playtime,
+         reviews_without_playtime, complete, buckets_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (output['app_id'], output['total_reviews'],
+          output['reviews_with_playtime'], output['reviews_without_playtime'],
+          1 if output['complete'] else 0, json.dumps(output['buckets'])))
+    conn.commit()
+
+    out_path = os.path.join(OUTPUT_DIR, '{}.json'.format(output['app_id']))
+    with open(out_path, 'w') as f:
+        json.dump(output, f, indent=2)
+
+
+# Copy any existing JSON results into the DB so the group gets them too
+def import_json_files(conn):
+    if not os.path.isdir(OUTPUT_DIR):
+        print('No review_data folder at {}, nothing to import'.format(OUTPUT_DIR))
+        return
+    json_count = 0
+    for filename in os.listdir(OUTPUT_DIR):
+        if filename.endswith('.json'):
+            json_count += 1
+    print('Found {} JSON files in {}'.format(json_count, OUTPUT_DIR))
+    imported = 0
+    for filename in os.listdir(OUTPUT_DIR):
+        if not filename.endswith('.json'):
+            continue
+        app_id = int(filename.replace('.json', ''))
+        row = conn.execute('SELECT 1 FROM reviews WHERE app_id = ?',
+                           (app_id,)).fetchone()
+        if row is not None:
+            continue  # already in DB
+        with open(os.path.join(OUTPUT_DIR, filename), 'r') as f:
+            data = json.load(f)
+        conn.execute('''
+            INSERT INTO reviews
+            (app_id, total_reviews, reviews_with_playtime,
+             reviews_without_playtime, complete, buckets_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (app_id, data.get('total_reviews', 0),
+              data.get('reviews_with_playtime', 0),
+              data.get('reviews_without_playtime', 0),
+              1 if data.get('complete', False) else 0,
+              json.dumps(data.get('buckets', []))))
+        imported += 1
+    conn.commit()
+    if imported > 0:
+        print('Imported {} existing JSON results into crawl.db'.format(imported))
+
+
 # ---- Main scrape function ----
 
 def scrape(app_ids):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print('Database: {}'.format(os.path.join(CRAWL_DIR, 'crawl.db')))
+    conn = open_db()
+    import_json_files(conn)
+    row = conn.execute('SELECT COUNT(*) FROM reviews').fetchone()
+    print('{} games already in the reviews table'.format(row[0]))
+
     print('Scraping reviews for {} games'.format(len(app_ids)))
     print('-' * 50)
 
     for i, app_id in enumerate(app_ids):
         # Skip games we already scraped fully (resume support).
-        # If the file exists but has fewer reviews than the target,
-        # it probably got cut short by a 403, so we redo it.
-        out_path = os.path.join(OUTPUT_DIR, '{}.json'.format(app_id))
-        if os.path.exists(out_path):
-            with open(out_path, 'r') as f:
-                old = json.load(f)
+        # If it was saved but has fewer reviews than the target,
+        # it probably got cut short, so we redo it.
+        old = load_previous(conn, app_id)
+        if old is not None:
             if old.get('total_reviews', 0) >= REVIEWS_PER_GAME:
                 print('[{}/{}] app {} already done, skipping'.format(
                     i + 1, len(app_ids), app_id))
@@ -253,9 +368,8 @@ def scrape(app_ids):
                 'complete': complete,
                 'buckets': []
             }
-            with open(out_path, 'w') as f:
-                json.dump(output, f, indent=2)
-            print('  no reviews found, saved as complete')
+            save_result(conn, output)
+            print('  no reviews found, saved')
             continue
 
         buckets, skipped = make_buckets(reviews)
@@ -269,8 +383,7 @@ def scrape(app_ids):
             'buckets': buckets
         }
 
-        with open(out_path, 'w') as f:
-            json.dump(output, f, indent=2)
+        save_result(conn, output)
 
         print('  saved {} reviews in buckets'.format(len(reviews)))
 
@@ -279,8 +392,10 @@ def scrape(app_ids):
             print('  waiting {} seconds before next game...'.format(GAME_DELAY))
             time.sleep(GAME_DELAY)
 
+    conn.close()
     print('-' * 50)
-    print('Done. Output in {}/'.format(OUTPUT_DIR))
+    print('Done. Results in {}/crawl.db (reviews table) and {}/'.format(
+        CRAWL_DIR, OUTPUT_DIR))
 
 
 # ---- Entry point ----
