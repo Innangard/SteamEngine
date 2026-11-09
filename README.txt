@@ -1,7 +1,8 @@
-Steam Crawler and Review Scraper (CS 454)
+Steam Crawler, Review Scraper and Search Engine (CS 454)
 
 I wrote two scripts that collect data from the Steam store for our search project. Both use only the Python standard library and share one SQLite database, crawl_data/crawl.db.
 They can run at the same time without stepping on each other.
+The search side (build_index.py and search_engine.py) reads from that database and needs Whoosh: "pip install whoosh".
 
 FILES
 crawler.py          BFS crawler for store.steampowered.com. Skips non-English pages and puts unseen /app/ pages at the front of the queue.
@@ -13,7 +14,7 @@ search_engine.py    Interactive command line search over index_dir/. Run "python
 crawl_data/crawl.db         The database. This is the only data file you need, both scripts write all their data here.
 crawl_data/urls.json        {page_id: url} export, rewritten when the crawler exits.
 crawl_data/adjacency.csv.gz Edge list export (source,target), rewritten when the crawler exits.
-index_dir/                  Whoosh index, not in git. Rebuild it with build_index.py after pulling a new crawl.db.
+index_dir/                  Whoosh index, not in git. See SEARCH INDEX below.
 
 DATABASE SCHEMA
 urls        every URL the crawler has seen, visited or not
@@ -54,6 +55,22 @@ In Python:
   conn = sqlite3.connect('crawl_data/crawl.db')
   row = conn.execute('SELECT buckets_json FROM reviews WHERE app_id = ?', (730,)).fetchone()
   buckets = json.loads(row[0])
+
+SEARCH INDEX
+build_index.py reads every row of page_text and builds a fresh index in index_dir/ (it wipes any old index first). Each page becomes one Whoosh document:
+  page_id       ID, stored, unique    zero padded page ID like "00001", matches urls.id and page_text.page_id
+  url           ID, stored            the page URL, stored but not searched
+  title         TEXT, stored          game name from the /app/ID/Name/ slug, or the first 120 characters of the page for other pages
+  content       TEXT, stored          the page text with whitespace collapsed, stored so search results can show snippets
+Building the full index (about 119k pages) takes a while. Adding the pages goes fairly fast, then it prints "finishing index" and sits there while writer.commit() merges everything into the final index. That step shows no progress and can take a long time, so let it finish.
+Do not Ctrl+C during the commit. It leaves index_dir/ half written, and you have to delete it and run build_index.py again.
+The writer uses limitmb=512 so there is less to merge at the end. If your machine is short on memory, lower it to 256 in build_index.py.
+It is much faster with Windows Python on Windows files than with WSL Python on a /mnt/c folder.
+search_engine.py opens index_dir/ and asks for a mode before the first search:
+  point         every word in the query has to match (AND)
+  range         any word in the query can match (OR)
+It shows the top 10 results with title, URL, score and a snippet. Change TOP_K in search_engine.py for more or fewer. Type "quit" to exit.
+After pulling a new crawl.db, run build_index.py again so the index matches.
 
 NOTES
 Stop both scripts before committing crawl.db. Recent writes sit in crawl.db-wal until they are merged, and that file is not in git.
