@@ -8,11 +8,12 @@ crawler.py          BFS crawler for store.steampowered.com. Skips non-English pa
                     Run "python crawler.py" to start fresh or "python crawler.py resume" to pick up where it left off.
 scraper.py          Pulls app IDs from crawl.db and fetches reviews from Steam's IUserReviewsService/GetAppReviews API (needs an API key in STEAM_API_KEY).
                     Run "python scraper.py" for every app found by the crawler, or "python scraper.py 730 570" for specific apps.
-crawl_data/crawl.db         The database. This is the only data file you need.
+build_index.py      Builds the Whoosh search index in index_dir/ from the page_text table. Run "python build_index.py".
+search_engine.py    Interactive command line search over index_dir/. Run "python search_engine.py".
+crawl_data/crawl.db         The database. This is the only data file you need, both scripts write all their data here.
 crawl_data/urls.json        {page_id: url} export, rewritten when the crawler exits.
 crawl_data/adjacency.csv.gz Edge list export (source,target), rewritten when the crawler exits.
-crawl_data/pages/           One txt file per page (old format, kept for backup, not in git).
-review_data/                One JSON file per app (old format, kept for backup, not in git).
+index_dir/                  Whoosh index, not in git. Rebuild it with build_index.py after pulling a new crawl.db.
 
 DATABASE SCHEMA
 urls        every URL the crawler has seen, visited or not
@@ -56,4 +57,5 @@ In Python:
 
 NOTES
 Stop both scripts before committing crawl.db. Recent writes sit in crawl.db-wal until they are merged, and that file is not in git.
+Older versions wrote crawl_data/pages/*.txt and review_data/*.json. If those folders are still around, the scripts copy anything missing into crawl.db on startup, and after that the folders can be deleted.
 The database is tracked with Git LFS because it is too big for a normal GitHub file.

@@ -2,8 +2,8 @@
 # Crawls store.steampowered.com using BFS and saves
 # extracted text, visited URLs, and an adjacency matrix.
 #
-# State is stored in crawl.db (SQLite) so writes are
-# incremental instead of dumping a giant JSON every checkpoint.
+# Everything (crawl state, page text, links) is stored in
+# crawl_data/crawl.db (SQLite), written incrementally per page.
 #
 # No external dependencies, stdlib only
 #
@@ -242,9 +242,8 @@ def db_load_state(conn):
     }
 
 
-# Import existing page files into a fresh database.
-# Used to migrate from the old state.json system, or when
-# the DB was lost but pages/ folder survived.
+# One-time migration: import an old pages/ folder into an empty
+# database. Only reads files, and does nothing if the folder is gone.
 def db_import_pages(conn):
     pages_dir = os.path.join(OUTPUT_DIR, 'pages')
     if not os.path.isdir(pages_dir):
@@ -298,9 +297,9 @@ def db_import_pages(conn):
     }
 
 
-# Copy text from page files into page_text for any pages that
-# aren't in the table yet. Only does real work the first time
-# after upgrading, after that everything is already in the DB.
+# One-time migration: copy text from an old pages/ folder into
+# page_text for any pages not in the table yet. Only reads files,
+# and does nothing if the folder is gone.
 def backfill_page_text(conn):
     pages_dir = os.path.join(OUTPUT_DIR, 'pages')
     if not os.path.isdir(pages_dir):
@@ -374,7 +373,7 @@ def crawl(resume=False):
     domain = urlparse(SEED_URL).netloc
     robots = load_robots(domain)
 
-    os.makedirs(os.path.join(OUTPUT_DIR, 'pages'), exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Open or create the database
     conn = init_db()
@@ -531,20 +530,13 @@ def crawl(resume=False):
             # Commit all writes for this page at once
             conn.commit()
 
-            # Save extracted text (skip on rescan)
+            # Save extracted text to the database (skip on rescan)
             if not rescan:
                 text = parser.get_text()
-                # Store in database
                 conn.execute(
                     'INSERT OR REPLACE INTO page_text (page_id, url, text) '
                     'VALUES (?, ?, ?)', (page_id, url, text))
                 conn.commit()
-                # Also write to file for backwards compatibility
-                page_file = os.path.join(OUTPUT_DIR, 'pages',
-                                         '{:05d}.txt'.format(page_id))
-                with open(page_file, 'w', encoding='utf-8') as f:
-                    f.write('URL: {}\n\n'.format(url))
-                    f.write(text)
 
             if rescan:
                 print('[rescan] {} ({} links)'.format(url, len(outgoing_ids)))

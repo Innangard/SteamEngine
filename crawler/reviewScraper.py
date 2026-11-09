@@ -2,7 +2,7 @@
 # Reads app IDs from crawl.db (shared with crawler.py) and
 # fetches reviews from Steam's API. Saves bucketed data
 # (positive/negative counts by playtime bracket) into the
-# reviews table in crawl.db, plus JSON files for compatibility.
+# reviews table in crawl.db.
 #
 # No external dependencies, stdlib only
 #
@@ -253,24 +253,18 @@ def open_db():
     return conn
 
 
-# Look up a previous result for this app, from the DB or an old JSON file.
-# Returns a dict like the JSON output, or None if nothing saved yet.
+# Look up a previous result for this app in the DB.
+# Returns a dict with total_reviews and complete, or None if not saved yet.
 def load_previous(conn, app_id):
     row = conn.execute(
         'SELECT total_reviews, complete FROM reviews WHERE app_id = ?',
         (app_id,)).fetchone()
     if row is not None:
         return {'total_reviews': row[0], 'complete': bool(row[1])}
-
-    # Fall back to JSON files from before the DB existed
-    out_path = os.path.join(OUTPUT_DIR, '{}.json'.format(app_id))
-    if os.path.exists(out_path):
-        with open(out_path, 'r') as f:
-            return json.load(f)
     return None
 
 
-# Write one game's results to the DB and to its JSON file
+# Write one game's results to the DB
 def save_result(conn, output):
     conn.execute('''
         INSERT OR REPLACE INTO reviews
@@ -282,16 +276,12 @@ def save_result(conn, output):
           1 if output['complete'] else 0, json.dumps(output['buckets'])))
     conn.commit()
 
-    out_path = os.path.join(OUTPUT_DIR, '{}.json'.format(output['app_id']))
-    with open(out_path, 'w') as f:
-        json.dump(output, f, indent=2)
 
-
-# Copy any existing JSON results into the DB so the group gets them too
+# One-time migration: copy results from an old review_data folder
+# into the DB if one is still around. Only reads, never writes files.
 def import_json_files(conn):
     if not os.path.isdir(OUTPUT_DIR):
-        print('No review_data folder at {}, nothing to import'.format(OUTPUT_DIR))
-        return
+        return  # no old folder, nothing to migrate
     json_count = 0
     for filename in os.listdir(OUTPUT_DIR):
         if filename.endswith('.json'):
@@ -327,7 +317,6 @@ def import_json_files(conn):
 # ---- Main scrape function ----
 
 def scrape(app_ids):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     print('Database: {}'.format(os.path.join(CRAWL_DIR, 'crawl.db')))
     conn = open_db()
     import_json_files(conn)
@@ -394,8 +383,8 @@ def scrape(app_ids):
 
     conn.close()
     print('-' * 50)
-    print('Done. Results in {}/crawl.db (reviews table) and {}/'.format(
-        CRAWL_DIR, OUTPUT_DIR))
+    print('Done. Results in {} (reviews table)'.format(
+        os.path.join(CRAWL_DIR, 'crawl.db')))
 
 
 # ---- Entry point ----
