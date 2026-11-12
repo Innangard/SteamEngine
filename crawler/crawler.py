@@ -14,7 +14,7 @@
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse, quote
+from urllib.parse import urljoin, urlparse, quote, parse_qsl, urlencode
 from urllib.robotparser import RobotFileParser
 import json
 import csv
@@ -93,7 +93,33 @@ def clean_url(base, href):
     full = urljoin(base, href)
     parsed = urlparse(full)
     encoded_path = quote(parsed.path, safe='/')
-    return parsed._replace(fragment='', path=encoded_path).geturl()
+    cleaned = parsed._replace(fragment='', path=encoded_path).geturl()
+    return remove_junk_params(cleaned)
+
+
+# Query parameters that don't change which page you get:
+#   l   - language (?l=german), we want the English page
+#   snr - Steam's click tracking (?snr=1_4_4__145), differs per link
+JUNK_PARAMS = {'l', 'snr'}
+
+
+# Remove junk parameters so every copy of a page has the same URL.
+# Only rebuilds the URL if a junk param was actually there, so other
+# URLs stay exactly the same as before.
+def remove_junk_params(url):
+    parsed = urlparse(url)
+    if not parsed.query:
+        return url
+    kept = []
+    found = False
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key in JUNK_PARAMS:
+            found = True
+        else:
+            kept.append((key, value))
+    if not found:
+        return url
+    return parsed._replace(query=urlencode(kept)).geturl()
 
 
 # Check if a URL belongs to our crawl domain
@@ -342,6 +368,34 @@ def backfill_page_text(conn):
         print('Backfilled {} pages into page_text'.format(added))
 
 
+# Clean up the queue: strip junk params from every URL, then drop
+# anything already crawled and any duplicates. App pages keep the
+# front of the line only if their app ID is still new.
+# Rewrites the whole queue table, takes a few seconds on a big queue.
+def db_clean_queue(conn, visited, seen_app_ids):
+    rows = conn.execute(
+        'SELECT url, priority FROM queue ORDER BY priority, pos').fetchall()
+    before = len(rows)
+
+    keep = []
+    already_queued = set()
+    for url, priority in rows:
+        url = remove_junk_params(url)
+        if url in visited or url in already_queued:
+            continue
+        already_queued.add(url)
+        if priority == 0:
+            aid = get_app_id(url)
+            if aid is None or aid in seen_app_ids:
+                priority = 1  # not a new app anymore, back of the line
+        keep.append((url, priority))
+
+    conn.execute('DELETE FROM queue')
+    conn.executemany('INSERT INTO queue (url, priority) VALUES (?, ?)', keep)
+    conn.commit()
+    print('Cleaned queue: {} entries -> {}'.format(before, len(keep)))
+
+
 # Save the adjacency data as a sparse edge list, gzipped.
 # Each row is "source_id,target_id" meaning source links to target.
 # Sparse format only stores the 1s, so a page with 50 links
@@ -393,28 +447,24 @@ def crawl(resume=False):
             visited = set()
             url_to_id = {}
             next_id = 1
-            db_queue_add(conn, SEED_URL)
-            conn.commit()
         else:
             visited = state['visited']
             url_to_id = state['url_to_id']
             next_id = state['next_id']
             print('Resumed: {} pages done'.format(len(visited)))
-            # If queue is empty, queue all visited URLs for rescanning.
-            # The crawl loop will re-download them to discover their
-            # outgoing links, but won't re-save the page text.
-            if not db_queue_has_items(conn):
-                print('Queue empty, queueing visited pages for link rescan...')
-                for v_url in visited:
-                    db_queue_add(conn, v_url)
-                conn.commit()
-                print('Queued {} pages for rescan'.format(len(visited)))
     else:
         visited = set()           # URLs we've already crawled
         url_to_id = {}            # maps each URL to a numeric page ID
         next_id = 1               # next ID to assign
-        db_queue_add(conn, SEED_URL)
-        conn.commit()
+
+    # Number of pages actually crawled so far
+    count = len(visited)
+
+    # Pages crawled before junk params were stripped may be saved as
+    # /app/123/Name/?snr=1_4_4__145. Add the clean version of each one
+    # to visited too, so the clean URL counts as already crawled.
+    for v_url in list(visited):
+        visited.add(remove_junk_params(v_url))
 
     # Track unique app IDs we've seen so far
     seen_app_ids = set()
@@ -423,13 +473,27 @@ def crawl(resume=False):
         if aid is not None:
             seen_app_ids.add(aid)
 
+    # Tidy up whatever the queue has in it from earlier runs
+    if resume:
+        print('Cleaning queue...')
+        db_clean_queue(conn, visited, seen_app_ids)
+
+    # Always start with the store home page. Priority -1 puts it ahead
+    # of everything else in the queue, even app pages. The home page
+    # changes often, so re-reading it each run turns up new app IDs.
+    conn.execute('INSERT INTO queue (url, priority) VALUES (?, -1)',
+                 (SEED_URL,))
+    conn.commit()
+
     print('Crawling {} (no page limit)'.format(domain))
     if seen_app_ids:
         print('Already found {} unique app IDs'.format(len(seen_app_ids)))
     print('-' * 50)
 
-    count = len(visited)
     skipped_lang = 0  # pages skipped for non-English
+    # The home page is the one visited URL we re-download each run.
+    # This flips to False once it's been fetched so it only happens once.
+    refresh_home = True
 
     try:
         # BFS: keep going until the queue is empty or Ctrl+C
@@ -438,11 +502,17 @@ def crawl(resume=False):
             url = db_queue_pop(conn)
             if url is None:
                 break
+            # Just in case an entry slipped in with ?l= or ?snr=
+            url = remove_junk_params(url)
+
+            # Skip pages we already have, except the home page once per run
+            is_home = url == SEED_URL and refresh_home
+            if is_home:
+                refresh_home = False
+            elif url in visited:
+                continue
 
             # Skip off-domain or robots.txt blocked URLs
-            # Visited URLs are NOT skipped — we still re-download them
-            # to discover their outgoing links (but don't re-save the text)
-            rescan = url in visited
             if not is_same_domain(url, domain):
                 continue
             if not robots.can_fetch('*', url):
@@ -456,10 +526,13 @@ def crawl(resume=False):
                 # Skip non-HTML responses (images, PDFs, etc.)
                 ctype = resp.getheader('Content-Type', '')
                 if 'text/html' not in ctype:
+                    print('  [SKIP] not HTML: {}'.format(url))
+                    time.sleep(DELAY)  # we still made a request
                     continue
                 html = resp.read().decode('utf-8', errors='replace')
             except (URLError, HTTPError, TimeoutError, OSError) as e:
                 print('  [ERROR] {}'.format(e))
+                time.sleep(DELAY)  # we still made a request
                 continue
 
             # Feed the HTML into our parser to extract text and links
@@ -473,15 +546,22 @@ def crawl(resume=False):
             # Skip non-English pages
             if parser.lang and not parser.lang.startswith('en'):
                 skipped_lang += 1
-                # Still extract links so we can find app pages
+                print('  [SKIP] not English ({}): {}'.format(parser.lang, url))
+                # Still queue its links (clean_url turns them into English
+                # URLs), using the same priority rule as normal pages
                 for href in parser.links:
                     link = clean_url(url, href)
                     if is_same_domain(link, domain) and link not in visited:
-                        db_queue_add(conn, link, front=is_app_url(link))
+                        link_aid = get_app_id(link)
+                        front = link_aid is not None and link_aid not in seen_app_ids
+                        db_queue_add(conn, link, front=front)
                 conn.commit()
+                time.sleep(DELAY)  # we still made a request
                 continue
 
-            if not rescan:
+            # Only count it as a new page if we didn't already have it
+            # (the home page is usually already visited from a past run)
+            if url not in visited:
                 visited.add(url)
                 count += 1
 
@@ -500,9 +580,8 @@ def crawl(resume=False):
             page_id = url_to_id[url]
 
             # Write this page's URL and visited status to the database
-            if not rescan:
-                db_store_url(conn, page_id, url)
-                db_mark_visited(conn, page_id)
+            db_store_url(conn, page_id, url)
+            db_mark_visited(conn, page_id)
 
             # Process each link found on this page
             outgoing_ids = set()  # set so duplicate links are ignored
@@ -524,22 +603,22 @@ def crawl(resume=False):
                     front = link_aid is not None and link_aid not in seen_app_ids
                     db_queue_add(conn, link, front=front)
 
-            # Store this page's outgoing edges
+            # Store this page's outgoing edges, replacing any old ones
+            # (so re-reading the home page doesn't pile up duplicates)
+            conn.execute('DELETE FROM edges WHERE source_id = ?', (page_id,))
             db_add_edges(conn, page_id, outgoing_ids)
+
+            # Save extracted text (replaces the old home page text too)
+            text = parser.get_text()
+            conn.execute(
+                'INSERT OR REPLACE INTO page_text (page_id, url, text) '
+                'VALUES (?, ?, ?)', (page_id, url, text))
 
             # Commit all writes for this page at once
             conn.commit()
 
-            # Save extracted text to the database (skip on rescan)
-            if not rescan:
-                text = parser.get_text()
-                conn.execute(
-                    'INSERT OR REPLACE INTO page_text (page_id, url, text) '
-                    'VALUES (?, ?, ?)', (page_id, url, text))
-                conn.commit()
-
-            if rescan:
-                print('[rescan] {} ({} links)'.format(url, len(outgoing_ids)))
+            if is_home:
+                print('[home] {} ({} links)'.format(url, len(outgoing_ids)))
             else:
                 print('[{}] {} ({} links)'.format(
                     count, url, len(outgoing_ids)))
